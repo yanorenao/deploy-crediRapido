@@ -1,0 +1,194 @@
+name: CrediRapido CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: credirapidoacr.azurecr.io
+  IMAGE_NAME: credirapido-api
+  DOTNET_VERSION: '8.0.x'
+
+jobs:
+
+  # ── ETAPA 1: BUILD & PUSH ────────────────────────────────────────────
+  build:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build-push.outputs.digest }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+
+      - name: Build and push Docker image (IMMUTABLE)
+        id: build-push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache,mode=max
+
+  # ── ETAPA 2: VALIDACIÓN AUTOMÁTICA ──────────────────────────────────
+  validate:
+    name: Automated Validation
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore --locked-mode
+
+      - name: Run Unit Tests with Coverage
+        run: |
+          dotnet test --no-restore --collect:'XPlat Code Coverage' \
+            --results-directory ./coverage \
+            --DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura
+
+      - name: Check Coverage Gate (min 80%)
+        run: |
+          COVERAGE=$(cat coverage/**/coverage.cobertura.xml | grep -oP 'line-rate="\K[0-9.]+')
+          echo "Coverage: $COVERAGE"
+          python3 -c "import sys; sys.exit(0 if float('$COVERAGE') >= 0.80 else 1)"
+
+      - name: SAST - Static Analysis
+        run: dotnet build --no-restore /p:EnableNETAnalyzers=true /p:AnalysisMode=All
+
+      - name: Dependency vulnerability scan
+        run: |
+          dotnet list package --vulnerable --include-transitive 2>&1 | tee vuln-report.txt
+          if grep -q 'Critical\|High' vuln-report.txt; then
+            echo '::error::Critical/High vulnerabilities found'
+            exit 1
+          fi
+
+      - name: Container image scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}'
+          format: 'sarif'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
+      - name: IaC validation (Terraform)
+        run: |
+          cd infra/
+          terraform init -backend=false
+          terraform validate
+          terraform fmt -check -recursive
+
+  # ── ETAPA 3: DEPLOY QA ────────────────────────────────────────────────
+  deploy-qa:
+    name: Deploy to QA
+    runs-on: ubuntu-latest
+    needs: [build, validate]
+    environment: qa
+
+    steps:
+      - name: Deploy to Azure Container Apps (QA)
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          resource-group: rg-credirapido-qa
+          name: credirapido-app-qa
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}
+
+      - name: Run integration tests
+        run: |
+          sleep 30 # wait for app to start
+          dotnet test tests/Integration/ --no-build
+
+  # ── ETAPA 4: DEPLOY STAGING (con aprobación manual) ──────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build, deploy-qa]
+    environment:
+      name: staging
+      # GitHub Environment require reviewer approval
+
+    steps:
+      - name: Deploy to Staging (same immutable image)
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          resource-group: rg-credirapido-staging
+          name: credirapido-app-staging
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}
+
+      - name: Smoke tests on staging
+        run: ./scripts/smoke-tests.sh ${{ secrets.STAGING_URL }}
+
+  # ── ETAPA 5: DEPLOY PRODUCCIÓN (Canary) ──────────────────────────────
+  deploy-production:
+    name: Canary Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, deploy-staging]
+    environment: production
+
+    steps:
+      - name: Canary 5% - initial slice
+        uses: azure/cli@v1
+        with:
+          inlineScript: |
+            az containerapp revision copy \
+              --name credirapido-app-prod \
+              --resource-group rg-credirapido-prod \
+              --image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}
+
+            az containerapp ingress traffic set \
+              --name credirapido-app-prod \
+              --resource-group rg-credirapido-prod \
+              --revision-weight latest=5 previous=95
+
+      - name: Monitor canary metrics (5 min)
+        run: ./scripts/validate-canary.sh 5 300
+
+      - name: Canary 25% - expand
+        run: |
+          az containerapp ingress traffic set \
+            --name credirapido-app-prod \
+            --resource-group rg-credirapido-prod \
+            --revision-weight latest=25 previous=75
+
+      - name: Monitor canary metrics (10 min)
+        run: ./scripts/validate-canary.sh 25 600
+
+      - name: Canary 100% - full rollout
+        run: |
+          az containerapp ingress traffic set \
+            --name credirapido-app-prod \
+            --resource-group rg-credirapido-prod \
+            --revision-weight latest=100
